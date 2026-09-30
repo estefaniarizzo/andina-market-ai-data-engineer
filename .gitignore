@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+*.log
+
+# Secrets / credentials
+secrets/
+credentials/
+*.pem
+*.key
+config.local.*
+service-principal.json
+
+# Azure / Databricks local state
+.databricks/
+.dbx/
+terraform.tfstate
+terraform.tfstate.*
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Generated local data
+data/generated/
+output/
+tmp/
