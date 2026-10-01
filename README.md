@@ -1,78 +1,126 @@
-# Andina Market — AI Data Engineer Technical Challenge
+# Andina Market AI — Reto Data Engineer
 
-Implementación de los niveles 1 y 2 del reto técnico de **Talento Para Ti**.
+Plataforma de datos para Andina Market, una empresa colombiana de e-commerce de supermercado. La solución ingiere datos desde Azure SQL Database hacia Databricks usando una arquitectura medallion y prepara las capas Bronze, Silver y Gold para analítica, BI y machine learning.
 
-## Alcance
+## Alcance completado
 
-Este repositorio cubre:
+### Nivel 1 — Ingesta
 
-- Nivel 1: ingesta desde Azure SQL Database a Databricks.
-- Nivel 2: transformación, calidad y modelado de datos.
-- Diseño documentado para streaming y SAP on-premise.
+- Azure SQL Database desplegada y poblada como fuente transaccional.
+- Ingesta inicial de seis tablas fuente: `Customers`, `Products`, `Orders`, `OrderItems`, `Payments` y `SupportTickets`.
+- Ingesta batch implementada desde Azure SQL hacia Databricks Bronze.
+- Tablas Delta creadas en Unity Catalog bajo `workspace.bronze`.
+- Metadatos de ingesta y trazabilidad por ejecución implementados.
+- Tabla de control y watermarks creada en `workspace.control.ingestion_watermarks`.
+- Arquitectura documentada, incluyendo ingesta incremental, streaming e integración con SAP.
 
-No se implementan en esta entrega los niveles opcionales de visualización, Feature Store, RAG ni agentes GenAI.
-
-## Arquitectura objetivo
+## Arquitectura
 
 ```text
 Azure SQL Database
-        |
-        | JDBC + carga inicial / incremental por updated_at
-        v
-Databricks Bronze (Delta)
-        |
-        | tipado, deduplicación, calidad e integridad referencial
-        v
-Databricks Silver (Delta)
-        |
-        | modelo dimensional
-        v
-Databricks Gold (Delta)
+        ↓
+Exportación batch controlada / diseño JDBC incremental
+        ↓
+Databricks Unity Catalog
+        ↓
+Tablas Delta Bronze
+        ↓
+Silver: validación y estandarización
+        ↓
+Gold: modelo dimensional
+        ↓
+BI / ML
 ```
 
-## Decisiones iniciales
+## Tablas Bronze
 
-- **Fuente:** Azure SQL Database representa el sistema transaccional de Andina Market.
-- **Formato:** Delta Lake para soportar transacciones, `MERGE`, versionado e idempotencia.
-- **Incrementalidad:** la primera ejecución será completa; las siguientes utilizarán `updated_at` como watermark.
-- **Eliminaciones:** se representan mediante la columna `is_deleted` para capturar bajas lógicas.
-- **Trazabilidad:** las tablas Bronze incluirán metadatos de fuente, fecha de ingesta y ejecución.
-- **Calidad:** los registros inválidos se separarán de los registros válidos y conservarán la razón del rechazo.
-- **Histórico:** los cambios relevantes de clientes se manejarán con SCD Tipo 2 en la capa Gold.
+| Tabla Bronze | Tabla fuente |
+|---|---|
+| `workspace.bronze.customers` | `dbo.Customers` |
+| `workspace.bronze.products` | `dbo.Products` |
+| `workspace.bronze.orders` | `dbo.Orders` |
+| `workspace.bronze.order_items` | `dbo.OrderItems` |
+| `workspace.bronze.payments` | `dbo.Payments` |
+| `workspace.bronze.support_tickets` | `dbo.SupportTickets` |
 
-## Estructura
+Cada tabla Bronze conserva los campos crudos de la fuente y añade metadatos de ingesta:
+
+- `_source_system`
+- `_source_table`
+- `_source_file`
+- `_ingestion_run_id`
+- `_ingested_at`
+
+## Estrategia de ingesta incremental
+
+La estrategia de producción utiliza `updated_at` como watermark incremental:
+
+```sql
+WHERE updated_at > :last_successful_watermark
+  AND updated_at <= :current_upper_bound
+```
+
+La tabla `dbo.Payments` se extrae usando `updated_at` porque el estado de un pago puede cambiar después de su creación. Las eliminaciones lógicas se representan mediante `is_deleted`, de modo que las bajas viajan correctamente en cargas incrementales.
+
+La tabla `workspace.control.ingestion_watermarks` registra:
+
+- tabla fuente
+- último watermark exitoso
+- ID de ejecución de ingesta
+- filas leídas
+- estado de la ejecución
+- fecha y hora de actualización
+
+## Limitación del entorno y estrategia de demo
+
+Azure SQL fue desplegada, poblada y validada. La conectividad JDBC desde Databricks Free Edition alcanzó el servidor y la base de datos, pero el compute serverless no completó la sesión JDBC debido a las restricciones de red/egreso del entorno gratuito.
+
+Para evitar incluir credenciales en los notebooks y lograr una demo reproducible, la demostración implementada usa una exportación batch controlada desde Azure SQL mediante Python y `pyodbc` hacia archivos CSV temporales. Estos archivos se suben a un Unity Catalog Volume y se cargan en tablas Delta Bronze.
+
+La arquitectura objetivo de producción sigue siendo ingesta incremental directa por JDBC desde Azure SQL, con credenciales almacenadas en un secret scope o Azure Key Vault, extracción por watermark, reintentos y conectividad privada o con IPs de salida permitidas.
+
+## Diseño de streaming
+
+Para eventos de clickstream desde la app móvil, la arquitectura de producción sería:
 
 ```text
-.
-├── sql/          # Esquema fuente, generación de datos y validaciones SQL
-├── notebooks/    # Ingesta, transformación y publicación de tablas
-├── src/          # Código Python reutilizable y configuración sin secretos
-├── tests/        # Pruebas y validaciones de calidad
-├── docs/         # Decisiones, supuestos y diseños no implementados
-└── diagrams/     # Diagramas de arquitectura y modelo de datos
+App móvil
+  → Azure Event Hubs / Kafka
+  → Databricks Structured Streaming
+  → Bronze Delta
+  → Silver: sesionización y validación
+  → Gold: métricas y features de ML
 ```
 
-## Modelo fuente
+Cada evento incluiría un `event_id` único, `event_time`, `customer_id`, `session_id`, `event_type`, `product_id` y `channel`. La deduplicación usaría `event_id`; los eventos tardíos se manejarían con watermarks y checkpoints.
 
-La fuente transaccional contiene:
+## Diseño de integración SAP ECC
 
-- `dbo.Customers`
-- `dbo.Products`
-- `dbo.Orders`
-- `dbo.OrderItems`
-- `dbo.Payments`
-- `dbo.SupportTickets`
+Para SAP ECC on-premise, el patrón recomendado es una replicación desacoplada:
 
-El script `sql/01_create_source_schema.sql` define claves primarias, claves foráneas, restricciones de dominio, índices sobre `updated_at` y campos técnicos de auditoría.
+```text
+SAP ECC
+  → SAP SLT / middleware de integración
+  → Azure Data Lake Storage / Event Hubs
+  → Databricks Bronze
+  → Silver y Gold
+```
 
-## Ejecución
+La conectividad usaría VPN o ExpressRoute, identidad administrada, secretos en Azure Key Vault y permisos de Unity Catalog. Los datos de proveedores y órdenes de compra conservarían claves de negocio, timestamps de cambio y metadatos de origen para trazabilidad.
 
-La guía de reproducción se completará cuando estén configurados Azure SQL Database y Databricks.
+## Estructura del repositorio
 
-## Uso de IA
+```text
+sql/                  Scripts DDL, generación de datos y exportación desde Azure SQL
+notebooks/            Notebooks de ingesta y transformación en Databricks
+docs/                 Decisiones de arquitectura y diseño
+diagrams/             Diagramas de arquitectura
+data/staging/         Archivos temporales locales; no se versionan
+```
 
-Se utilizó asistencia de IA generativa para acelerar la estructura inicial del repositorio, el diseño del esquema y la documentación. Las decisiones técnicas, la validación y la implementación final serán revisadas y entendidas por la autora.
+## Próximos pasos
 
-## Estado
-
-En construcción.
+- Implementar Silver con limpieza, tipado, deduplicación y reglas de calidad.
+- Construir el modelo dimensional en Gold.
+- Añadir orquestación, reintentos y alertas.
+- Implementar ingesta incremental JDBC con watermarks y secretos gestionados.
