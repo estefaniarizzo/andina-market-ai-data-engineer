@@ -117,10 +117,40 @@ docs/                 Decisiones de arquitectura y diseño
 diagrams/             Diagramas de arquitectura
 data/staging/         Archivos temporales locales; no se versionan
 ```
+## Capa Silver
+
+La capa Silver estandariza y valida los datos ingeridos desde Bronze. Las tablas se almacenan bajo `workspace.silver`:
+
+- `workspace.silver.customers`
+- `workspace.silver.products`
+- `workspace.silver.orders`
+- `workspace.silver.order_items`
+- `workspace.silver.payments`
+- `workspace.silver.support_tickets`
+
+Las transformaciones implementadas incluyen:
+
+- Conversión de identificadores a tipos numéricos.
+- Conversión de fechas y timestamps a sus tipos correspondientes.
+- Conversión de valores monetarios a `DECIMAL(18,2)`.
+- Normalización de estados, prioridades, métodos de pago y canales de venta.
+- Eliminación de espacios en campos de texto y normalización de correos electrónicos a minúsculas.
+- Deduplicación de registros por llave primaria.
+- Preservación de los metadatos de origen y adición de metadatos de transformación.
+
+Cada tabla Silver incluye:
+
+- `_source_system`
+- `_source_table`
+- `_transformation_run_id`
+- `_transformed_at`
+
+Los resultados de calidad se registran en `workspace.control.data_quality_results`. Esta tabla incluye validaciones de unicidad de llave primaria y valores nulos en campos obligatorios, junto con el número de filas evaluadas, filas fallidas, estado de la validación y fecha de ejecución.
 
 ## Próximos pasos
 
-- Implementar Silver con limpieza, tipado, deduplicación y reglas de calidad.
-- Construir el modelo dimensional en Gold.
-- Añadir orquestación, reintentos y alertas.
+- Construir la capa Gold con tablas dimensionales y de hechos.
+- Implementar métricas de negocio para BI, como ingresos, ticket promedio y tasa de conversión.
+- Crear features para modelos de ML, incluyendo churn, valor del cliente y recomendaciones.
+- Añadir orquestación, reintentos y alertas para las ejecuciones de ingesta y transformación.
 - Implementar ingesta incremental JDBC con watermarks y secretos gestionados.
