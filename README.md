@@ -1,49 +1,78 @@
-# Andina Market AI — Reto Data Engineer
+# Andina Market AI — Reto Técnico Data Engineer
 
-Plataforma de datos para Andina Market, una empresa colombiana de e-commerce de supermercado. La solución ingiere datos desde Azure SQL Database hacia Databricks usando una arquitectura medallion y prepara las capas Bronze, Silver y Gold para analítica, BI y machine learning.
+Proyecto de plataforma de datos para Andina Market, un e-commerce ficticio de supermercado que opera en Latinoamérica mediante canales web, app móvil y tiendas físicas.
 
-## Alcance completado
+El objetivo es llevar datos transaccionales desde Azure SQL Database a Databricks, aplicar controles de calidad y dejar un modelo de datos listo para analítica y machine learning.
 
-### Nivel 1 — Ingesta
+## Nivel alcanzado
 
-- Azure SQL Database desplegada y poblada como fuente transaccional.
-- Ingesta inicial de seis tablas fuente: `Customers`, `Products`, `Orders`, `OrderItems`, `Payments` y `SupportTickets`.
-- Ingesta batch implementada desde Azure SQL hacia Databricks Bronze.
-- Tablas Delta creadas en Unity Catalog bajo `workspace.bronze`.
-- Metadatos de ingesta y trazabilidad por ejecución implementados.
-- Tabla de control y watermarks creada en `workspace.control.ingestion_watermarks`.
-- Arquitectura documentada, incluyendo ingesta incremental, streaming e integración con SAP.
+El alcance principal implementado corresponde a los niveles núcleo del reto:
+
+- **Nivel 1 — Ingesta de datos**
+- **Nivel 2 — Transformación y modelado**
+
+Como extensión técnica mínima se materializó una capa Gold de ventas, pero no se implementó dashboard ni los niveles opcionales de Feature Store, RAG o agentes GenAI. Se priorizó profundidad, trazabilidad, calidad de datos y capacidad de sustentar cada decisión.
 
 ## Arquitectura
 
+La solución usa una arquitectura medallion con Unity Catalog y Delta Lake:
+
 ```text
 Azure SQL Database
-        ↓
-Exportación batch controlada / diseño JDBC incremental
-        ↓
-Databricks Unity Catalog
-        ↓
-Tablas Delta Bronze
-        ↓
-Silver: validación y estandarización
-        ↓
-Gold: modelo dimensional
-        ↓
-BI / ML
+    ↓
+Exportación batch controlada a CSV
+    ↓
+Unity Catalog Volume
+    ↓
+Bronze Delta: réplica cruda y trazable
+    ↓
+Silver Delta: datos tipados, limpios y validados
+    ↓
+Gold Delta: modelo dimensional mínimo de ventas
 ```
 
-## Tablas Bronze
+Diagramas:
 
-| Tabla Bronze | Tabla fuente |
+- [Arquitectura de ingesta — Nivel 1](diagrams/architecture-level-1.md)
+- [Modelo de datos resultante — Nivel 2](diagrams/data-model-level-2.md)
+
+## Fuente transaccional
+
+La fuente de verdad es Azure SQL Database. Se desplegó una base de datos propia y se pobló directamente mediante Python y `pyodbc` con datos sintéticos coherentes.
+
+Las tablas fuente son:
+
+| Tabla Azure SQL | Contenido |
 |---|---|
-| `workspace.bronze.customers` | `dbo.Customers` |
-| `workspace.bronze.products` | `dbo.Products` |
-| `workspace.bronze.orders` | `dbo.Orders` |
-| `workspace.bronze.order_items` | `dbo.OrderItems` |
-| `workspace.bronze.payments` | `dbo.Payments` |
-| `workspace.bronze.support_tickets` | `dbo.SupportTickets` |
+| `dbo.Customers` | Datos de clientes y segmentación |
+| `dbo.Products` | Catálogo de productos |
+| `dbo.Orders` | Pedidos y su estado |
+| `dbo.OrderItems` | Líneas de cada pedido |
+| `dbo.Payments` | Pagos, método, monto y estado |
+| `dbo.SupportTickets` | Tickets de soporte con texto libre |
 
-Cada tabla Bronze conserva los campos crudos de la fuente y añade metadatos de ingesta:
+## Nivel 1 — Ingesta
+
+### Implementación realizada
+
+La demostración realiza una carga inicial controlada:
+
+1. Un script Python consulta Azure SQL mediante `pyodbc`.
+2. El script exporta cada tabla fuente a un CSV temporal en `data/staging/`.
+3. Los archivos se cargan a `workspace.bronze.landing`, un Unity Catalog Volume.
+4. El notebook `01_ingest_bronze` escribe tablas Delta en `workspace.bronze`.
+5. Cada ejecución registra su estado en `workspace.control.ingestion_watermarks`.
+
+Las tablas Bronze creadas son:
+
+- `workspace.bronze.customers`
+- `workspace.bronze.products`
+- `workspace.bronze.orders`
+- `workspace.bronze.order_items`
+- `workspace.bronze.payments`
+- `workspace.bronze.support_tickets`
+
+Bronze conserva los campos de origen como texto y añade los siguientes metadatos:
 
 - `_source_system`
 - `_source_table`
@@ -51,75 +80,85 @@ Cada tabla Bronze conserva los campos crudos de la fuente y añade metadatos de 
 - `_ingestion_run_id`
 - `_ingested_at`
 
-## Estrategia de ingesta incremental
+### Estrategia incremental de producción
 
-La estrategia de producción utiliza `updated_at` como watermark incremental:
+La primera carga es completa. Para producción, las cargas posteriores usarían `updated_at` como watermark, con límite inferior y superior para evitar perder cambios durante la ejecución:
 
 ```sql
 WHERE updated_at > :last_successful_watermark
   AND updated_at <= :current_upper_bound
 ```
 
-La tabla `dbo.Payments` se extrae usando `updated_at` porque el estado de un pago puede cambiar después de su creación. Las eliminaciones lógicas se representan mediante `is_deleted`, de modo que las bajas viajan correctamente en cargas incrementales.
+`dbo.Payments` usa `updated_at`, no solamente la fecha de creación, porque el estado de un pago puede cambiar después de que se crea un pedido.
 
-La tabla `workspace.control.ingestion_watermarks` registra:
+La frecuencia inicial propuesta es cada hora para entidades transaccionales. La frecuencia se ajustaría según el SLA, volumen y costo de cómputo.
 
-- tabla fuente
-- último watermark exitoso
-- ID de ejecución de ingesta
-- filas leídas
-- estado de la ejecución
-- fecha y hora de actualización
+### Trazabilidad, idempotencia y fallos
 
-## Limitación del entorno y estrategia de demo
+La tabla `workspace.control.ingestion_watermarks` almacena tabla fuente, watermark, ID de ejecución, filas leídas, estado y timestamp.
 
-Azure SQL fue desplegada, poblada y validada. La conectividad JDBC desde Databricks Free Edition alcanzó el servidor y la base de datos, pero el compute serverless no completó la sesión JDBC debido a las restricciones de red/egreso del entorno gratuito.
+La demo usa `overwrite` para producir snapshots completos e idempotentes: ejecutar el notebook nuevamente reemplaza el snapshot Bronze en lugar de duplicar registros. En producción se usaría `MERGE` sobre Delta Lake, con una llave de negocio y watermark, para aplicar inserciones y actualizaciones incrementales sin duplicación.
 
-Para evitar incluir credenciales en los notebooks y lograr una demo reproducible, la demostración implementada usa una exportación batch controlada desde Azure SQL mediante Python y `pyodbc` hacia archivos CSV temporales. Estos archivos se suben a un Unity Catalog Volume y se cargan en tablas Delta Bronze.
+En producción, un Job/Workflow ejecutaría los notebooks en orden, con reintentos, alertas ante fallo y actualización del watermark únicamente después de una ejecución exitosa.
 
-La arquitectura objetivo de producción sigue siendo ingesta incremental directa por JDBC desde Azure SQL, con credenciales almacenadas en un secret scope o Azure Key Vault, extracción por watermark, reintentos y conectividad privada o con IPs de salida permitidas.
+### Evolución de esquema
 
-## Diseño de streaming
+En la demo, Bronze conserva datos crudos y la estructura se sobrescribe de forma controlada debido al volumen reducido. En producción:
 
-Para eventos de clickstream desde la app móvil, la arquitectura de producción sería:
+- Se compararía el schema entrante con el schema Delta esperado antes de transformar.
+- Las columnas nuevas compatibles se permitirían en Bronze y se registrarían en auditoría.
+- Cambios de tipo, eliminación o renombrado de columnas se enviarían a revisión antes de afectar Silver.
+- Las transformaciones Silver seleccionarían explícitamente las columnas esperadas para aislar a consumidores de cambios no validados.
 
-```text
-App móvil
-  → Azure Event Hubs / Kafka
-  → Databricks Structured Streaming
-  → Bronze Delta
-  → Silver: sesionización y validación
-  → Gold: métricas y features de ML
-```
+### Restricción del entorno
 
-Cada evento incluiría un `event_id` único, `event_time`, `customer_id`, `session_id`, `event_type`, `product_id` y `channel`. La deduplicación usaría `event_id`; los eventos tardíos se manejarían con watermarks y checkpoints.
+Azure SQL fue desplegada, poblada y validada como fuente real. Se intentó conectividad JDBC directa desde Databricks Free Edition, pero el compute serverless no completó la sesión JDBC por restricciones de red/egreso.
 
-## Diseño de integración SAP ECC
+Para no guardar credenciales dentro de notebooks y mantener la demostración reproducible, se implementó una exportación batch controlada mediante Python y `pyodbc` hacia CSV temporales. Los CSV se cargan en un Unity Catalog Volume y luego se convierten a tablas Delta Bronze.
 
-Para SAP ECC on-premise, el patrón recomendado es una replicación desacoplada:
+La arquitectura objetivo de producción mantiene JDBC incremental directo, secretos en Azure Key Vault o secret scope y conectividad privada o con IPs de salida permitidas.
+
+### Diseño propuesto para streaming
+
+El streaming no se implementó, conforme al alcance solicitado. Para eventos de clickstream de la app móvil se propone:
 
 ```text
-SAP ECC
-  → SAP SLT / middleware de integración
-  → Azure Data Lake Storage / Event Hubs
-  → Databricks Bronze
-  → Silver y Gold
+App móvil → Azure Event Hubs o Kafka → Databricks Structured Streaming
+→ Bronze Delta → Silver → BI / ML
 ```
 
-La conectividad usaría VPN o ExpressRoute, identidad administrada, secretos en Azure Key Vault y permisos de Unity Catalog. Los datos de proveedores y órdenes de compra conservarían claves de negocio, timestamps de cambio y metadatos de origen para trazabilidad.
+Cada evento tendría `event_id`, `event_time`, `customer_id`, `session_id`, `event_type`, `product_id` y `channel`.
 
-## Estructura del repositorio
+- La deduplicación se realizaría por `event_id`.
+- Se usaría watermark sobre `event_time` para gestionar eventos tardíos.
+- Los checkpoints persistentes permitirían recuperarse de fallos sin reprocesar eventos confirmados.
+- El trigger inicial sería cada minuto, ajustable al SLA.
+
+### Diseño propuesto para SAP ECC
+
+SAP ECC on-premise no se implementó porque el reto solicita únicamente diseño. La propuesta es:
 
 ```text
-sql/                  Scripts DDL, generación de datos y exportación desde Azure SQL
-notebooks/            Notebooks de ingesta y transformación en Databricks
-docs/                 Decisiones de arquitectura y diseño
-diagrams/             Diagramas de arquitectura
-data/staging/         Archivos temporales locales; no se versionan
+SAP ECC → SAP SLT / SAP Data Services / middleware
+→ Azure Data Lake Storage Gen2 o Azure Event Hubs
+→ Databricks Bronze → Silver → consumo analítico / ML
 ```
-## Capa Silver
 
-La capa Silver estandariza y valida los datos ingeridos desde Bronze. Las tablas se almacenan bajo `workspace.silver`:
+La conectividad usaría VPN o ExpressRoute, identidad administrada, Azure Key Vault y permisos de Unity Catalog. Se conservarían claves de negocio, timestamps de cambio y metadatos de origen.
+
+## Nivel 2 — Transformación y modelado
+
+### Responsabilidad de las capas
+
+| Capa | Responsabilidad |
+|---|---|
+| Bronze | Conserva la réplica cruda y trazable de la fuente |
+| Silver | Aplica tipos, normalización, deduplicación y reglas de calidad |
+| Gold | Publica un modelo dimensional mínimo de ventas para consumo analítico |
+
+### Capa Silver
+
+El notebook `02_transform_silver` crea estas tablas Delta:
 
 - `workspace.silver.customers`
 - `workspace.silver.products`
@@ -128,29 +167,128 @@ La capa Silver estandariza y valida los datos ingeridos desde Bronze. Las tablas
 - `workspace.silver.payments`
 - `workspace.silver.support_tickets`
 
-Las transformaciones implementadas incluyen:
+Transformaciones implementadas:
 
-- Conversión de identificadores a tipos numéricos.
-- Conversión de fechas y timestamps a sus tipos correspondientes.
-- Conversión de valores monetarios a `DECIMAL(18,2)`.
-- Normalización de estados, prioridades, métodos de pago y canales de venta.
-- Eliminación de espacios en campos de texto y normalización de correos electrónicos a minúsculas.
-- Deduplicación de registros por llave primaria.
-- Preservación de los metadatos de origen y adición de metadatos de transformación.
+- Conversión de IDs a tipos numéricos.
+- Conversión de fechas y timestamps.
+- Conversión de montos a `DECIMAL(18,2)`.
+- Normalización de textos, correos, estados, prioridades, métodos de pago y canales.
+- Deduplicación por llave primaria.
+- Conservación de `is_deleted` para borrado lógico.
+- Preservación de metadatos de origen y creación de `_transformation_run_id` y `_transformed_at`.
 
-Cada tabla Silver incluye:
+### Calidad de datos
 
-- `_source_system`
-- `_source_table`
-- `_transformation_run_id`
-- `_transformed_at`
+Los resultados se guardan en `workspace.control.data_quality_results`.
 
-Los resultados de calidad se registran en `workspace.control.data_quality_results`. Esta tabla incluye validaciones de unicidad de llave primaria y valores nulos en campos obligatorios, junto con el número de filas evaluadas, filas fallidas, estado de la validación y fecha de ejecución.
+Validaciones implementadas:
+
+- Valores nulos en campos obligatorios.
+- Unicidad de llaves primarias.
+- Integridad referencial:
+  - `orders.customer_id → customers.customer_id`
+  - `order_items.order_id → orders.order_id`
+  - `order_items.product_id → products.product_id`
+  - `payments.order_id → orders.order_id`
+  - `support_tickets.customer_id → customers.customer_id`
+
+La integridad de productos valida existencia histórica del `product_id`; un producto `discontinued` puede seguir asociado a pedidos anteriores y no constituye una referencia inválida.
+
+### Cambios en el tiempo
+
+La demostración utiliza SCD Tipo 1 en Silver: la tabla representa el estado más reciente de cada entidad por su llave de negocio, y el campo `updated_at` permite detectar modificaciones.
+
+Para producción, los atributos históricos relevantes —por ejemplo, el segmento del cliente— se modelarían con SCD Tipo 2 en una dimensión histórica. Esto agregaría una surrogate key, `effective_from`, `effective_to` e `is_current`, permitiendo consultar el valor vigente en cada momento.
+
+Los pagos se capturan con `updated_at` porque su estado puede cambiar posteriormente. El borrado lógico se conserva mediante `is_deleted`.
+
+### Organización y particionamiento
+
+Las tablas se almacenan en Delta Lake y se organizan por capa dentro de Unity Catalog.
+
+No se aplicó particionamiento físico debido al volumen sintético reducido: particionar tablas pequeñas agrega archivos y complejidad sin mejorar rendimiento. En producción, las tablas grandes de hechos se particionarían por fecha (`order_date` o `payment_date`) y se evaluaría `OPTIMIZE` / Z-Ordering según los patrones reales de consulta.
+
+### Extensión Gold
+
+Como extensión mínima se crearon:
+
+- `workspace.gold.dim_customers`
+- `workspace.gold.dim_products`
+- `workspace.gold.dim_date`
+- `workspace.gold.fact_sales`
+- `workspace.gold.agg_daily_sales`
+
+`fact_sales` tiene una fila por línea de pedido. Se conecta conceptualmente con clientes, productos y fechas. `agg_daily_sales` agrega pedidos, unidades e ingresos por fecha, categoría y canal.
+
+Esta extensión demuestra cómo los datos Silver pueden materializarse para análisis sin reemplazar el modelo operacional validado de Silver.
+
+## Reproducibilidad
+
+### Requisitos
+
+- Azure SQL Database.
+- Python 3.10 o superior.
+- ODBC Driver 18 for SQL Server.
+- Dependencias Python del proyecto.
+- Databricks Free Edition con Unity Catalog habilitado.
+
+### Variables de entorno
+
+Crear un archivo `.env` en la raíz del proyecto, sin versionarlo:
+
+```env
+AZURE_SQL_SERVER=tu-servidor.database.windows.net
+AZURE_SQL_DATABASE=tu-base-de-datos
+AZURE_SQL_USERNAME=tu-usuario
+AZURE_SQL_PASSWORD=tu-password
+```
+
+### Ejecución
+
+1. Crear las tablas fuente ejecutando los scripts DDL de `sql/`.
+2. Generar e insertar los datos sintéticos directamente en Azure SQL.
+3. Exportar la fuente a staging:
+
+```bash
+python sql/04_export_source_to_csv.py
+```
+
+4. Cargar los seis CSV de `data/staging/` al Volume `workspace.bronze.landing`.
+5. Ejecutar, en este orden, los notebooks:
+
+   - `01_ingest_bronze.py`
+   - `02_transform_silver.py`
+   - `03_publish_gold.py` (extensión no obligatoria)
+
+## Estructura del repositorio
+
+```text
+sql/                  DDL, generación de datos y exportación Azure SQL
+notebooks/            Notebooks de ingesta y transformación
+diagrams/             Diagramas de arquitectura y modelo de datos
+docs/                 Decisiones, evidencias y material de sustentación
+data/staging/         Archivos temporales locales, excluidos de Git
+README.md             Documentación principal
+```
+
+## Supuestos y limitaciones
+
+- Los datos son sintéticos y se generaron de forma coherente con las relaciones del modelo.
+- La demostración usa una carga batch manual controlada por las restricciones de red de Databricks Free Edition.
+- La muestra de datos no tiene volumen suficiente para justificar particionamiento físico.
+- Azure SQL y Databricks Free Edition se usaron para controlar costos del entorno.
+- La operación productiva requeriría secretos gestionados, conectividad privada, un Job/Workflow, alertas y carga incremental mediante `MERGE`.
+- El archivo `.env` y los CSV de staging no se versionan porque pueden contener credenciales o datos temporales.
+
+## Uso de IA
+
+Se utilizó asistencia de IA generativa para acelerar la generación de datos sintéticos, proponer estructuras iniciales de scripts, transformación, validaciones y documentación. Todas las decisiones de arquitectura se revisaron, ajustaron y validaron ejecutando el pipeline y verificando los resultados en Azure SQL y Databricks.
 
 ## Próximos pasos
 
-- Construir la capa Gold con tablas dimensionales y de hechos.
-- Implementar métricas de negocio para BI, como ingresos, ticket promedio y tasa de conversión.
-- Crear features para modelos de ML, incluyendo churn, valor del cliente y recomendaciones.
-- Añadir orquestación, reintentos y alertas para las ejecuciones de ingesta y transformación.
-- Implementar ingesta incremental JDBC con watermarks y secretos gestionados.
+- Orquestar los notebooks con Databricks Jobs/Workflows.
+- Implementar JDBC incremental directo con secretos gestionados y conectividad segura.
+- Implementar SCD Tipo 2 para atributos de cliente que requieran historial.
+- Añadir monitoreo, alertas y manejo de errores centralizado.
+- Construir un dashboard con KPIs de ingresos, pedidos, ticket promedio y ventas por canal.
+- Extender la solución a Feature Store, RAG y agentes GenAI cuando el alcance y el volumen lo justifiquen.

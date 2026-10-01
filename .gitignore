@@ -31,3 +31,7 @@ Thumbs.db
 data/generated/
 output/
 tmp/
+
+# Temporary local staging exports
+data/staging/
+data/staging/*
