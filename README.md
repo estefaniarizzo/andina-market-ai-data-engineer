@@ -282,7 +282,9 @@ README.md             Documentación principal
 
 ## Uso de IA
 
-Se utilizó asistencia de IA generativa para acelerar la generación de datos sintéticos, proponer estructuras iniciales de scripts, transformación, validaciones y documentación. Todas las decisiones de arquitectura se revisaron, ajustaron y validaron ejecutando el pipeline y verificando los resultados en Azure SQL y Databricks.
+El código del pipeline, los notebooks, las pruebas y gran parte de la documentación fueron generados con asistencia de IA. Yo configuré la infraestructura en Azure —incluyendo acceso de red y los identificadores de conexión—, desplegué y ejecuté la solución en Databricks, y revisé los resultados.
+
+Esta entrega refleja una solución construida con apoyo de IA, que posteriormente configuré, ejecuté y comprendí para poder explicarla.
 
 ## Próximos pasos
 
