@@ -162,7 +162,7 @@ databricks bundle deploy   -t dev     # sube notebooks + src/ y crea el Job "[de
 | `staging` | `workspace.stg_*` | `/Volumes/workspace/stg_bronze/landing` | pausado |
 | `prod` | `workspace.bronze`, ... | `/Volumes/workspace/bronze/landing` | cada hora |
 
-La primera ejecución del Job crea los esquemas y los Volumes (`landing`, `checkpoints`).
+El exportador con `--upload` crea el esquema y el Volume `landing` si no existen; el Job crea el resto de esquemas y el Volume `checkpoints`.
 
 ### 4. Carga inicial e incremental
 

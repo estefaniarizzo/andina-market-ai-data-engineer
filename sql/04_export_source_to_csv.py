@@ -107,10 +107,30 @@ def export_table(cursor, run_id, file_name, source_table, order_column, low, hig
     return output_file, count, max_updated_at
 
 
+def ensure_volume(client, volume_path):
+    """Create the target schema and managed Volume on first use (/Volumes/<catalog>/<schema>/<volume>)."""
+    from databricks.sdk.errors import AlreadyExists, ResourceAlreadyExists
+    from databricks.sdk.service.catalog import VolumeType
+
+    parts = volume_path.strip("/").split("/")
+    if len(parts) < 4 or parts[0] != "Volumes":
+        raise ValueError(f"--volume-path debe ser /Volumes/<catalogo>/<esquema>/<volume>: {volume_path}")
+    catalog, schema, volume = parts[1:4]
+    try:
+        client.schemas.create(name=schema, catalog_name=catalog)
+    except (AlreadyExists, ResourceAlreadyExists):
+        pass
+    try:
+        client.volumes.create(catalog_name=catalog, schema_name=schema, name=volume, volume_type=VolumeType.MANAGED)
+    except (AlreadyExists, ResourceAlreadyExists):
+        pass
+
+
 def upload_files(files, volume_path):
     from databricks.sdk import WorkspaceClient  # auth: DATABRICKS_HOST/TOKEN or ~/.databrickscfg
 
     client = WorkspaceClient()
+    ensure_volume(client, volume_path)
     for local_file in files:
         relative = local_file.relative_to(OUTPUT_DIR).as_posix()
         with local_file.open("rb") as content:
