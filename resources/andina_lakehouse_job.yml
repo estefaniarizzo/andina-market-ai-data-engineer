@@ -1,0 +1,40 @@
+resources:
+  jobs:
+    andina_lakehouse_job:
+      name: andina-lakehouse-${bundle.target}
+      description: Azure SQL landing files -> Bronze (Auto Loader) -> Silver (quality, MERGE, SCD2) -> Gold (optional)
+      max_concurrent_runs: 1  # Bronze/Silver checkpoints must not run concurrently
+      schedule:
+        quartz_cron_expression: "0 15 * * * ?"  # hourly, after the exporter drops the files
+        timezone_id: UTC
+        pause_status: ${var.schedule_pause_status}
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: schema_prefix
+          default: ${var.schema_prefix}
+        - name: max_error_rate
+          default: ${var.max_error_rate}
+        - name: full_refresh
+          default: "false"
+      # No cluster definition: tasks run on serverless compute (the only option in Free Edition).
+      tasks:
+        - task_key: bronze_ingest
+          notebook_task:
+            notebook_path: ../notebooks/01_ingest_bronze.py
+          # One retry: with schemaEvolutionMode=addNewColumns Auto Loader stops once
+          # when a new source column appears and continues on restart.
+          max_retries: 1
+          min_retry_interval_millis: 60000
+
+        - task_key: silver_transform
+          depends_on:
+            - task_key: bronze_ingest
+          notebook_task:
+            notebook_path: ../notebooks/02_transform_silver.py
+
+        - task_key: gold_publish
+          depends_on:
+            - task_key: silver_transform
+          notebook_task:
+            notebook_path: ../notebooks/03_publish_gold.py

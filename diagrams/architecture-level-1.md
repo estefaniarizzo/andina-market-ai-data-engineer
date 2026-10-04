@@ -4,56 +4,40 @@
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         FUENTE TRANSACCIONAL                        │
-│                         Azure SQL Database                          │
-│                                                                     │
-│ dbo.Customers      dbo.Products        dbo.Orders                   │
-│ dbo.OrderItems     dbo.Payments        dbo.SupportTickets           │
-│                                                                     │
-│ Datos sintéticos insertados directamente mediante Python + pyodbc   │
+│                  FUENTE TRANSACCIONAL — Azure SQL Database           │
+│ dbo.Customers  dbo.Products  dbo.Orders  dbo.OrderItems              │
+│ dbo.Payments   dbo.SupportTickets   (updated_at indexado, is_deleted)│
 └──────────────────────────────────┬──────────────────────────────────┘
-                                   │
-                                   │ Exportación batch controlada
-                                   │ Python + pyodbc
-                                   ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     Staging local temporal                                  │
-│                     data/staging/*.csv                                      │
-│                                                                             │
-│ customers | products | orders | order_items | payments | support_tickets    │
-└──────────────────────────────────┬──────────────────────────────────────────┘
-                                   │
-                                   │ Carga manual al Volume
+                                   │ sql/04_export_source_to_csv.py (pyodbc)
+                                   │ updated_at > watermark − lookback
+                                   │ AND updated_at <= high_watermark (fijo al inicio)
+                                   │ watermark avanza solo si todo terminó bien
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                   Databricks Free Edition                           │
-│                                                                     │
-│ Unity Catalog: workspace                                            │
-│ Schema Bronze: workspace.bronze                                     │
-│ Volume: workspace.bronze.landing                                    │
-│                                                                     │
-│ CSV landing → notebooks/01_ingest_bronze                            │
-│              → tablas Delta Bronze                                  │
-│                                                                     │
-│ Bronze metadata:                                                    │
-│ _source_system | _source_table | _source_file                       │
-│ _ingestion_run_id | _ingested_at                                    │
+│ UC Volume <catalog>.<prefix>bronze.landing                           │
+│   customers/customers_<run_id>.csv ... payments/payments_<run_id>.csv │
+│   _manifests/<run_id>.json  (rango de watermarks, filas, archivos)    │
 └──────────────────────────────────┬──────────────────────────────────┘
-                                   │
-                                   │ Auditoría y control
+                                   │ Job: bronze_ingest (notebooks/01_ingest_bronze)
+                                   │ Auto Loader cloudFiles · availableNow
+                                   │ checkpoint + schemaLocation por tabla
+                                   │ addNewColumns · _rescued_data · append-only
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                      workspace.control                              │
-│                                                                     │
-│ ingestion_watermarks                                                │
-│ - source_table                                                      │
-│ - last_successful_watermark                                         │
-│ - last_run_id                                                       │
-│ - rows_read                                                         │
-│ - run_status                                                        │
-│ - updated_at                                                        │
+│ Bronze Delta <prefix>bronze.<tabla>  — todas las versiones recibidas  │
+│ _source_system | _source_table | _source_file | _source_file_modified_at│
+│ _ingestion_run_id | _ingested_at                                      │
+└──────────────────────────────────┬──────────────────────────────────┘
+                                   │ Job: silver_transform → gold_publish (opcional)
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ <prefix>control                                                       │
+│ ingestion_watermarks · silver_progress · data_quality_results         │
+│ quarantine_records · Volume checkpoints                               │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+Entornos (Bundle `databricks.yml`): `dev` → `dev_*`, `staging` → `stg_*`, `prod` → sin prefijo.
 
 ## Arquitectura objetivo de producción
 

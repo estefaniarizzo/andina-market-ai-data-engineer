@@ -1,165 +1,82 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Nivel 1 — Ingesta a Bronze
+# MAGIC # Nivel 1 — Ingesta incremental a Bronze (Auto Loader)
 # MAGIC
-# MAGIC Carga archivos CSV exportados desde Azure SQL Database, almacenados en un
-# MAGIC Unity Catalog Volume, a tablas Delta Bronze. Agrega metadatos de trazabilidad
-# MAGIC y registra el resultado de la ejecución en una tabla de control.
+# MAGIC Ingesta los CSV que el exportador incremental (`sql/04_export_source_to_csv.py`) deja en el
+# MAGIC Volume `landing/<tabla>/` y los agrega a tablas Delta Bronze.
+# MAGIC
+# MAGIC | Decisión | Cómo |
+# MAGIC |---|---|
+# MAGIC | Solo archivos nuevos | Auto Loader (`cloudFiles`) con checkpoint por tabla en el Volume `checkpoints` |
+# MAGIC | Ejecución tipo batch programado | `trigger(availableNow=True)`: procesa lo pendiente y termina (serverless) |
+# MAGIC | Fidelidad a la fuente | Todo como `string` (`inferColumnTypes=false`); el tipado ocurre en Silver |
+# MAGIC | Cambios de esquema | `schemaEvolutionMode=addNewColumns` + `mergeSchema`; valores que no encajan van a `_rescued_data` |
+# MAGIC | Historial | Solo `append`: cada versión de un registro (p. ej. un pago `pending` → `approved`) queda guardada |
+# MAGIC | Trazabilidad | `_source_system`, `_source_table`, `_source_file`, `_source_file_modified_at`, `_ingestion_run_id`, `_ingested_at` |
+# MAGIC | Control | `control.ingestion_watermarks`: filas leídas y mayor `updated_at` disponible en Bronze por tabla |
+# MAGIC
+# MAGIC Los parámetros llegan desde el Job del Bundle (`databricks.yml`); al ejecutarlo a mano se usan los valores por defecto.
 
 # COMMAND ----------
 
-from datetime import datetime, timezone
+import os
+import sys
 from uuid import uuid4
 
-from pyspark.sql import functions as F
-from pyspark.sql import Row
-from pyspark.sql.types import (
-    LongType,
-    StringType,
-    StructField,
-    StructType,
-    TimestampType,
-)
+sys.path.append(os.path.abspath(os.path.join(os.getcwd(), "..", "src")))
 
+from andina_pipeline import pipeline  # noqa: E402
+from andina_pipeline.config import LakehouseConfig  # noqa: E402
 
-CATALOG = "workspace"
-BRONZE_SCHEMA = "bronze"
-CONTROL_SCHEMA = "control"
-LANDING_VOLUME = "landing"
+dbutils.widgets.text("catalog", "workspace")
+dbutils.widgets.text("schema_prefix", "")
+dbutils.widgets.dropdown("full_refresh", "false", ["false", "true"])
 
-LANDING_PATH = f"/Volumes/{CATALOG}/{BRONZE_SCHEMA}/{LANDING_VOLUME}"
-INGESTION_RUN_ID = str(uuid4())
-INGESTED_AT = datetime.now(timezone.utc).replace(tzinfo=None)
+cfg = LakehouseConfig(catalog=dbutils.widgets.get("catalog"), schema_prefix=dbutils.widgets.get("schema_prefix"))
+FULL_REFRESH = dbutils.widgets.get("full_refresh") == "true"
+RUN_ID = str(uuid4())
+dbutils.jobs.taskValues.set(key="run_id", value=RUN_ID)
 
-SOURCE_TABLES = {
-    "customers": "dbo.Customers",
-    "products": "dbo.Products",
-    "orders": "dbo.Orders",
-    "order_items": "dbo.OrderItems",
-    "payments": "dbo.Payments",
-    "support_tickets": "dbo.SupportTickets",
-}
-
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{BRONZE_SCHEMA}")
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{CONTROL_SCHEMA}")
+pipeline.ensure_schemas(spark, cfg)
+spark.sql(f"CREATE VOLUME IF NOT EXISTS {cfg.bronze}.{cfg.landing_volume}")
+spark.sql(f"CREATE VOLUME IF NOT EXISTS {cfg.control}.{cfg.checkpoint_volume}")
+print(f"Landing: {cfg.landing_path}\nCheckpoints: {cfg.checkpoint_path}\nRun ID: {RUN_ID}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Carga CSV a Delta Bronze
-# MAGIC
-# MAGIC Se mantiene el contenido fuente como texto (`inferSchema=false`) para preservar
-# MAGIC la fidelidad de Bronze. El tipado y la calidad se aplican en Silver.
+# MAGIC ## Full refresh (opcional)
+# MAGIC Borra tablas Bronze y checkpoints para reconstruir todo desde los archivos del Volume.
+# MAGIC Solo se usa en el primer despliegue o tras un cambio incompatible; lo normal es `false`.
 
 # COMMAND ----------
 
-for target_table, source_table in SOURCE_TABLES.items():
-    csv_path = f"{LANDING_PATH}/{target_table}.csv"
+if FULL_REFRESH:
+    pipeline.reset(spark, cfg, ["bronze"], remove_path=lambda path: dbutils.fs.rm(path, True))
+    print("Bronze reiniciado")
 
-    raw_df = (
-        spark.read
-        .option("header", "true")
-        .option("inferSchema", "false")
-        .csv(csv_path)
-    )
+# COMMAND ----------
 
-    bronze_df = (
-        raw_df
-        .withColumn("_source_system", F.lit("azure_sql"))
-        .withColumn("_source_table", F.lit(source_table))
-        .withColumn("_source_file", F.lit(csv_path))
-        .withColumn("_ingestion_run_id", F.lit(INGESTION_RUN_ID))
-        .withColumn("_ingested_at", F.lit(INGESTED_AT).cast("timestamp"))
-    )
+results = pipeline.run_bronze(spark, cfg, RUN_ID, use_autoloader=True)
 
-    (
-        bronze_df.write
-        .format("delta")
-        .mode("overwrite")
-        .option("overwriteSchema", "true")
-        .saveAsTable(f"{CATALOG}.{BRONZE_SCHEMA}.{target_table}")
-    )
-
-    row_count = spark.table(
-        f"{CATALOG}.{BRONZE_SCHEMA}.{target_table}"
-    ).count()
-
-    print(
-        f"{target_table}: {row_count} rows -> "
-        f"{CATALOG}.{BRONZE_SCHEMA}.{target_table}"
-    )
+display(spark.createDataFrame(
+    [(r["entity"], r["target"], r["rows_read"], r["watermark"]) for r in results],
+    "entity string, target string, rows_read bigint, watermark timestamp",
+))
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Registro de control de ingesta
-# MAGIC
-# MAGIC Registra una fila por tabla fuente. En la demo, `last_successful_watermark`
-# MAGIC se deja nulo porque la carga es completa; en producción se actualizaría
-# MAGIC con el mayor `updated_at` confirmado después de una carga incremental exitosa.
+# MAGIC ## Evidencia: historial de un pago en Bronze
+# MAGIC Un pago que cambió de estado aparece una vez por cada exportación que lo incluyó.
 
 # COMMAND ----------
 
-watermark_schema = StructType([
-    StructField("source_table", StringType(), False),
-    StructField("last_successful_watermark", TimestampType(), True),
-    StructField("last_run_id", StringType(), False),
-    StructField("rows_read", LongType(), False),
-    StructField("run_status", StringType(), False),
-    StructField("updated_at", TimestampType(), False),
-])
-
-watermark_rows = [
-    Row(
-        source_table=source_table,
-        last_successful_watermark=None,
-        last_run_id=INGESTION_RUN_ID,
-        rows_read=spark.table(
-            f"{CATALOG}.{BRONZE_SCHEMA}.{target_table}"
-        ).count(),
-        run_status="success",
-        updated_at=INGESTED_AT,
-    )
-    for target_table, source_table in SOURCE_TABLES.items()
-]
-
-watermarks_df = spark.createDataFrame(
-    watermark_rows,
-    schema=watermark_schema,
-)
-
-(
-    watermarks_df.write
-    .format("delta")
-    .mode("append")
-    .saveAsTable(f"{CATALOG}.{CONTROL_SCHEMA}.ingestion_watermarks")
-)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Validación de Bronze
-
-# COMMAND ----------
-
-for table_name in SOURCE_TABLES:
-    table_path = f"{CATALOG}.{BRONZE_SCHEMA}.{table_name}"
-
-    validation = (
-        spark.table(table_path)
-        .agg(
-            F.count("*").alias("row_count"),
-            F.countDistinct("_ingestion_run_id").alias("ingestion_runs"),
-            F.countDistinct("_source_system").alias("source_systems"),
-        )
-        .collect()[0]
-    )
-
-    print(
-        f"{table_path}: "
-        f"rows={validation['row_count']}, "
-        f"ingestion_runs={validation['ingestion_runs']}, "
-        f"source_systems={validation['source_systems']}"
-    )
-
-print(f"\nBronze ingestion completed. Run ID: {INGESTION_RUN_ID}")
+display(spark.sql(f"""
+    SELECT payment_id, payment_status, payment_date, updated_at, _source_file, _ingested_at
+    FROM {cfg.table('bronze', 'payments')}
+    WHERE payment_id IN (
+        SELECT payment_id FROM {cfg.table('bronze', 'payments')}
+        GROUP BY payment_id HAVING COUNT(DISTINCT payment_status) > 1 LIMIT 5)
+    ORDER BY payment_id, updated_at
+"""))

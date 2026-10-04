@@ -1,296 +1,253 @@
 # Andina Market AI — Reto Técnico Data Engineer
 
-Proyecto de plataforma de datos para Andina Market, un e-commerce ficticio de supermercado que opera en Latinoamérica mediante canales web, app móvil y tiendas físicas.
+Plataforma de datos para Andina Market, un e-commerce ficticio de supermercado que opera en Latinoamérica por web, app móvil y tiendas físicas.
 
-El objetivo es llevar datos transaccionales desde Azure SQL Database a Databricks, aplicar controles de calidad y dejar un modelo de datos listo para analítica y machine learning.
+Lleva los datos transaccionales de Azure SQL Database a Databricks (Unity Catalog + Delta Lake) de forma **incremental**, conserva el **historial de cambios**, aplica **calidad de datos como código** y deja un modelo listo para analítica y machine learning.
 
-## Nivel alcanzado
+## Alcance
 
-El alcance principal implementado corresponde a los niveles núcleo del reto:
+| Nivel | Estado |
+|---|---|
+| **Nivel 1 — Ingesta** (obligatorio) | Implementado: export incremental por watermark, Auto Loader con checkpoints, evolución de esquema, trazabilidad, Job + Bundle dev/staging/prod. Streaming y SAP como diseño, con muestra de clickstream. |
+| **Nivel 2 — Transformación y modelado** (obligatorio) | Implementado: tipado, deduplicación determinista, `MERGE`, SCD2, reglas de calidad como código con cuarentena y corte del pipeline. |
+| Nivel 3 — Gold (opcional) | Extensión mínima: modelo dimensional de ventas, sin dashboard. |
+| Feature Store, RAG, agentes GenAI | Fuera de alcance. |
 
-- **Nivel 1 — Ingesta de datos**
-- **Nivel 2 — Transformación y modelado**
-
-Como extensión técnica mínima se materializó una capa Gold de ventas, pero no se implementó dashboard ni los niveles opcionales de Feature Store, RAG o agentes GenAI. Se priorizó profundidad, trazabilidad, calidad de datos y capacidad de sustentar cada decisión.
+Las decisiones y sus alternativas están en [docs/architecture-decisions.md](docs/architecture-decisions.md).
 
 ## Arquitectura
 
-La solución usa una arquitectura medallion con Unity Catalog y Delta Lake:
-
 ```text
-Azure SQL Database
-    ↓
-Exportación batch controlada a CSV
-    ↓
-Unity Catalog Volume
-    ↓
-Bronze Delta: réplica cruda y trazable
-    ↓
-Silver Delta: datos tipados, limpios y validados
-    ↓
-Gold Delta: modelo dimensional mínimo de ventas
+Azure SQL Database (6 tablas, updated_at + is_deleted)
+    │  sql/04_export_source_to_csv.py
+    │  incremental: updated_at > (watermark − lookback) AND updated_at <= high_watermark
+    ▼
+UC Volume  <catalog>.<prefix>bronze.landing/<tabla>/<tabla>_<run_id>.csv   (+ _manifests/)
+    │  Auto Loader (cloudFiles, availableNow) · checkpoint por tabla · addNewColumns
+    ▼
+Bronze Delta   append-only, todo string, metadatos de linaje → historial completo de versiones
+    │  solo filas nuevas (_ingested_at > control.silver_progress)
+    │  tipado · dedupe determinista · reglas de calidad
+    ├──────────────► control.quarantine_records   (filas con error, JSON original + motivo)
+    ▼
+Silver Delta   <tabla> (SCD1, MERGE)  +  <tabla>_history (SCD2: customers, products, orders, payments)
+    │                                     control.data_quality_results · control.ingestion_watermarks
+    ▼
+Gold Delta (opcional)  dim_customers, dim_products, dim_date, fact_sales, agg_daily_sales
 ```
 
-Diagramas:
+Orquestación: Job `bronze_ingest → silver_transform → gold_publish`, definido en [databricks.yml](databricks.yml) y [resources/andina_lakehouse_job.yml](resources/andina_lakehouse_job.yml).
 
-- [Arquitectura de ingesta — Nivel 1](diagrams/architecture-level-1.md)
-- [Modelo de datos resultante — Nivel 2](diagrams/data-model-level-2.md)
+Diagramas: [arquitectura de ingesta — Nivel 1](diagrams/architecture-level-1.md) · [modelo de datos — Nivel 2](diagrams/data-model-level-2.md) · [streaming y SAP](docs/streaming-and-sap-design.md).
 
-## Fuente transaccional
+### Por qué archivos y no JDBC directo
 
-La fuente de verdad es Azure SQL Database. Se desplegó una base de datos propia y se pobló directamente mediante Python y `pyodbc` con datos sintéticos coherentes.
+Databricks Free Edition (serverless) no pudo completar la sesión JDBC hacia Azure SQL por restricciones de red. El export corre fuera de Databricks y deja archivos en un Volume, que Auto Loader ingiere de forma incremental. Así las credenciales de Azure SQL nunca entran a Databricks. En producción, con red privada, se usaría JDBC/Lakeflow Connect con secret scope y el resto del pipeline no cambia.
 
-Las tablas fuente son:
+## Fuente transaccional y datos sintéticos
 
-| Tabla Azure SQL | Contenido |
-|---|---|
-| `dbo.Customers` | Datos de clientes y segmentación |
-| `dbo.Products` | Catálogo de productos |
-| `dbo.Orders` | Pedidos y su estado |
-| `dbo.OrderItems` | Líneas de cada pedido |
-| `dbo.Payments` | Pagos, método, monto y estado |
-| `dbo.SupportTickets` | Tickets de soporte con texto libre |
+Azure SQL con `dbo.Customers`, `dbo.Products`, `dbo.Orders`, `dbo.OrderItems`, `dbo.Payments` y `dbo.SupportTickets` (PK, FK, CHECK, `created_at`, `updated_at`, `is_deleted`, índice en `updated_at`). DDL: [sql/01_create_source_schema.sql](sql/01_create_source_schema.sql).
+
+`sql/02_seed_source_data.py` genera datos reproducibles (semilla fija) con `fast_executemany`:
+
+| Tabla | Filas | Qué incluye |
+|---|---|---|
+| Customers | 2.000 | 5 países, ciudades ponderadas, segmentos Regular/Premium/Business, emails en mayúsculas o con espacios, algunos inválidos, teléfonos nulos, bajas lógicas |
+| Products | 40 | catálogo coherente por categoría, productos descontinuados, aumentos de precio |
+| Orders | 12.000 | 540 días con estacionalidad y crecimiento, canal según segmento, todos los estados; 15 pedidos con total distinto a sus líneas (a propósito) |
+| OrderItems | ~22.400 | 1 a 5 líneas por pedido, precio vigente a la fecha del pedido |
+| Payments | ~13.000 | métodos por país, pendientes, rechazados con reintento aprobado, reembolsos de cancelados, 8 cobros duplicados (a propósito) |
+| SupportTickets | 1.500 | asunto y texto coherentes con un pedido o producto real, algunos tickets vacíos |
+
+`sql/05_simulate_source_changes.py` aplica cambios operativos como los de un día real para demostrar la carga incremental: pagos `pending → approved`, rechazos con reintento, reembolsos, pedidos `paid → shipped → delivered`, cancelaciones, clientes `Regular → Premium → Business`, bajas lógicas, altas, cambios de precio y tickets nuevos o resueltos.
 
 ## Nivel 1 — Ingesta
 
-### Implementación realizada
+### Export incremental (`sql/04_export_source_to_csv.py`)
 
-La demostración realiza una carga inicial controlada:
+1. Fija el límite superior `high = SYSUTCDATETIME()` al inicio, para que la ventana no se mueva durante la corrida.
+2. Por tabla lee `updated_at > low AND updated_at <= high`, con `low = último watermark − lookback` (10 min por defecto). El lookback cubre transacciones confirmadas tarde. Las filas que repite se resuelven en Silver.
+3. Escribe `landing/<tabla>/<tabla>_<run_id>.csv` y un manifiesto `_manifests/<run_id>.json` con rango, filas y archivos.
+4. Con `--upload` sube los archivos al Volume (Databricks SDK).
+5. El watermark (`data/state/export_watermarks.json`) **solo avanza si todo terminó bien**. Si la corrida falla, la siguiente repite la misma ventana.
 
-1. Un script Python consulta Azure SQL mediante `pyodbc`.
-2. El script exporta cada tabla fuente a un CSV temporal en `data/staging/`.
-3. Los archivos se cargan a `workspace.bronze.landing`, un Unity Catalog Volume.
-4. El notebook `01_ingest_bronze` escribe tablas Delta en `workspace.bronze`.
-5. Cada ejecución registra su estado en `workspace.control.ingestion_watermarks`.
+`dbo.Payments` se extrae por `updated_at` y no por fecha de creación, porque su estado cambia después de creado el pedido. Cada versión queda en Bronze.
 
-Las tablas Bronze creadas son:
+### Bronze (`src/andina_pipeline/bronze.py`, notebook `01_ingest_bronze`)
 
-- `workspace.bronze.customers`
-- `workspace.bronze.products`
-- `workspace.bronze.orders`
-- `workspace.bronze.order_items`
-- `workspace.bronze.payments`
-- `workspace.bronze.support_tickets`
+- **Auto Loader** (`cloudFiles`, CSV) con `trigger(availableNow=True)`: procesa solo los archivos nuevos y termina, ideal para un Job programado en serverless.
+- **Checkpoint y schema location** por tabla en el Volume `<prefix>control.checkpoints`: cada archivo se ingiere exactamente una vez, aun con reintentos.
+- **Append-only**: no hay `overwrite`. Bronze guarda todas las versiones de cada registro y permite reconstruir Silver.
+- **Evolución de esquema**: `schemaEvolutionMode=addNewColumns` + `mergeSchema`. El Job reintenta Bronze una vez, porque Auto Loader se detiene al ver una columna nueva. Los valores que no encajan van a `_rescued_data`. Si falta una columna del contrato, el pipeline falla; si hay una nueva, se reporta y no llega a Silver hasta agregarla al contrato.
+- **Linaje**: `_source_system`, `_source_table`, `_source_file`, `_source_file_modified_at`, `_ingestion_run_id`, `_ingested_at`.
+- **Control**: `control.ingestion_watermarks` registra por corrida y tabla las filas leídas y el mayor `updated_at` disponible.
 
-Bronze conserva los campos de origen como texto y añade los siguientes metadatos:
+### Streaming y SAP (diseño)
 
-- `_source_system`
-- `_source_table`
-- `_source_file`
-- `_ingestion_run_id`
-- `_ingested_at`
-
-### Estrategia incremental de producción
-
-La primera carga es completa. Para producción, las cargas posteriores usarían `updated_at` como watermark, con límite inferior y superior para evitar perder cambios durante la ejecución:
-
-```sql
-WHERE updated_at > :last_successful_watermark
-  AND updated_at <= :current_upper_bound
-```
-
-`dbo.Payments` usa `updated_at`, no solamente la fecha de creación, porque el estado de un pago puede cambiar después de que se crea un pedido.
-
-La frecuencia inicial propuesta es cada hora para entidades transaccionales. La frecuencia se ajustaría según el SLA, volumen y costo de cómputo.
-
-### Trazabilidad, idempotencia y fallos
-
-La tabla `workspace.control.ingestion_watermarks` almacena tabla fuente, watermark, ID de ejecución, filas leídas, estado y timestamp.
-
-La demo usa `overwrite` para producir snapshots completos e idempotentes: ejecutar el notebook nuevamente reemplaza el snapshot Bronze en lugar de duplicar registros. En producción se usaría `MERGE` sobre Delta Lake, con una llave de negocio y watermark, para aplicar inserciones y actualizaciones incrementales sin duplicación.
-
-En producción, un Job/Workflow ejecutaría los notebooks en orden, con reintentos, alertas ante fallo y actualización del watermark únicamente después de una ejecución exitosa.
-
-### Evolución de esquema
-
-En la demo, Bronze conserva datos crudos y la estructura se sobrescribe de forma controlada debido al volumen reducido. En producción:
-
-- Se compararía el schema entrante con el schema Delta esperado antes de transformar.
-- Las columnas nuevas compatibles se permitirían en Bronze y se registrarían en auditoría.
-- Cambios de tipo, eliminación o renombrado de columnas se enviarían a revisión antes de afectar Silver.
-- Las transformaciones Silver seleccionarían explícitamente las columnas esperadas para aislar a consumidores de cambios no validados.
-
-### Restricción del entorno
-
-Azure SQL fue desplegada, poblada y validada como fuente real. Se intentó conectividad JDBC directa desde Databricks Free Edition, pero el compute serverless no completó la sesión JDBC por restricciones de red/egreso.
-
-Para no guardar credenciales dentro de notebooks y mantener la demostración reproducible, se implementó una exportación batch controlada mediante Python y `pyodbc` hacia CSV temporales. Los CSV se cargan en un Unity Catalog Volume y luego se convierten a tablas Delta Bronze.
-
-La arquitectura objetivo de producción mantiene JDBC incremental directo, secretos en Azure Key Vault o secret scope y conectividad privada o con IPs de salida permitidas.
-
-### Diseño propuesto para streaming
-
-El streaming no se implementó, conforme al alcance solicitado. Para eventos de clickstream de la app móvil se propone:
-
-```text
-App móvil → Azure Event Hubs o Kafka → Databricks Structured Streaming
-→ Bronze Delta → Silver → BI / ML
-```
-
-Cada evento tendría `event_id`, `event_time`, `customer_id`, `session_id`, `event_type`, `product_id` y `channel`.
-
-- La deduplicación se realizaría por `event_id`.
-- Se usaría watermark sobre `event_time` para gestionar eventos tardíos.
-- Los checkpoints persistentes permitirían recuperarse de fallos sin reprocesar eventos confirmados.
-- El trigger inicial sería cada minuto, ajustable al SLA.
-
-### Diseño propuesto para SAP ECC
-
-SAP ECC on-premise no se implementó porque el reto solicita únicamente diseño. La propuesta es:
-
-```text
-SAP ECC → SAP SLT / SAP Data Services / middleware
-→ Azure Data Lake Storage Gen2 o Azure Event Hubs
-→ Databricks Bronze → Silver → consumo analítico / ML
-```
-
-La conectividad usaría VPN o ExpressRoute, identidad administrada, Azure Key Vault y permisos de Unity Catalog. Se conservarían claves de negocio, timestamps de cambio y metadatos de origen.
+Muestra en [data/samples/clickstream_events.jsonl](data/samples/clickstream_events.jsonl): 3.392 eventos `product_view`, `add_to_cart` y `purchase`, con duplicados, eventos tardíos, sesiones anónimas y un campo nuevo. Se regenera con `scripts/generate_clickstream.py`. El diseño con Event Hubs + Structured Streaming y el de SAP ECC con SLT/ODP están en [docs/streaming-and-sap-design.md](docs/streaming-and-sap-design.md).
 
 ## Nivel 2 — Transformación y modelado
 
-### Responsabilidad de las capas
+### Capas
 
 | Capa | Responsabilidad |
 |---|---|
-| Bronze | Conserva la réplica cruda y trazable de la fuente |
-| Silver | Aplica tipos, normalización, deduplicación y reglas de calidad |
-| Gold | Publica un modelo dimensional mínimo de ventas para consumo analítico |
+| Bronze | Réplica cruda, append-only y trazable de cada versión recibida |
+| Silver | Estado actual tipado y validado (SCD1) + historial (SCD2) + cuarentena |
+| Gold (opcional) | Modelo dimensional de ventas |
 
-### Capa Silver
+### Silver (`src/andina_pipeline/silver.py`, notebook `02_transform_silver`)
 
-El notebook `02_transform_silver` crea estas tablas Delta:
+1. **Incremental**: solo filas de Bronze con `_ingested_at` mayor al registrado en `control.silver_progress`.
+2. **Contrato y tipado** ([config.py](src/andina_pipeline/config.py)): IDs enteros, montos `DECIMAL(18,2)`, timestamps con o sin milisegundos (`try_to_timestamp`), normalización de textos, emails, códigos de país y dominios.
+3. **Deduplicación determinista**: última versión por llave según `updated_at DESC, _ingested_at DESC, _source_file DESC`.
+4. **Calidad como código** ([quality.py](src/andina_pipeline/quality.py)), ver abajo.
+5. **SCD1**: `MERGE` en `silver.<tabla>` que solo actualiza si la versión entrante no es más vieja (no retrocede con datos tardíos ni con el lookback).
+6. **SCD2**: `silver.<tabla>_history` con `valid_from`, `valid_to` e `is_current`. Columnas rastreadas:
+   - `customers`: segmento, email, ciudad, país, baja.
+   - `payments`: estado, monto, fecha, baja.
+   - `orders`: estado, total, baja.
+   - `products`: precio, estado, baja.
 
-- `workspace.silver.customers`
-- `workspace.silver.products`
-- `workspace.silver.orders`
-- `workspace.silver.order_items`
-- `workspace.silver.payments`
-- `workspace.silver.support_tickets`
+   Un solo `MERGE` cierra la versión vigente e inserta la nueva. Funciona con varias versiones de la misma llave en un lote y es idempotente ante reprocesos.
 
-Transformaciones implementadas:
-
-- Conversión de IDs a tipos numéricos.
-- Conversión de fechas y timestamps.
-- Conversión de montos a `DECIMAL(18,2)`.
-- Normalización de textos, correos, estados, prioridades, métodos de pago y canales.
-- Deduplicación por llave primaria.
-- Conservación de `is_deleted` para borrado lógico.
-- Preservación de metadatos de origen y creación de `_transformation_run_id` y `_transformed_at`.
+Pagos se procesan después de pedidos, y pedidos después de clientes, para que la integridad referencial se valide contra Silver ya actualizado.
 
 ### Calidad de datos
 
-Los resultados se guardan en `workspace.control.data_quality_results`.
+| Severidad | Efecto | Ejemplos |
+|---|---|---|
+| `error` (fila) | a `control.quarantine_records` con el JSON original y los motivos | llave o `updated_at` nulo, fecha imposible de convertir, estado fuera de dominio, cantidad ≤ 0, monto negativo, `line_total ≠ quantity × unit_price`, `payment_date` nulo en pago `approved`/`refunded`, FK huérfana |
+| `warn` (fila) | se conserva, marcada en `_dq_warnings` | email inválido, ticket vacío, fecha futura |
+| umbral | si los `error` superan `max_error_rate` (5 % en prod) **el lote no se escribe y la tarea falla** | fuente rota o cambio de formato |
+| `critical` (tabla) | el Job falla | llave duplicada en Silver, más de una versión vigente en SCD2 |
+| `warn` (tabla) | se reporta | total del pedido ≠ suma de líneas, cobros duplicados o mayores al total, pedidos pagados o despachados sin pago aprobado |
 
-Validaciones implementadas:
-
-- Valores nulos en campos obligatorios.
-- Unicidad de llaves primarias.
-- Integridad referencial:
-  - `orders.customer_id → customers.customer_id`
-  - `order_items.order_id → orders.order_id`
-  - `order_items.product_id → products.product_id`
-  - `payments.order_id → orders.order_id`
-  - `support_tickets.customer_id → customers.customer_id`
-
-La integridad de productos valida existencia histórica del `product_id`; un producto `discontinued` puede seguir asociado a pedidos anteriores y no constituye una referencia inválida.
-
-### Cambios en el tiempo
-
-La demostración utiliza SCD Tipo 1 en Silver: la tabla representa el estado más reciente de cada entidad por su llave de negocio, y el campo `updated_at` permite detectar modificaciones.
-
-Para producción, los atributos históricos relevantes —por ejemplo, el segmento del cliente— se modelarían con SCD Tipo 2 en una dimensión histórica. Esto agregaría una surrogate key, `effective_from`, `effective_to` e `is_current`, permitiendo consultar el valor vigente en cada momento.
-
-Los pagos se capturan con `updated_at` porque su estado puede cambiar posteriormente. El borrado lógico se conserva mediante `is_deleted`.
+`payment_date` es obligatorio solo para pagos `approved`/`refunded`: en `pending`/`rejected` es nulo por diseño. Los productos descontinuados siguen siendo válidos para ventas históricas. Todos los resultados quedan en `control.data_quality_results`.
 
 ### Organización y particionamiento
 
-Las tablas se almacenan en Delta Lake y se organizan por capa dentro de Unity Catalog.
+Tablas Delta por capa en Unity Catalog (`<catalog>.<prefix>{bronze,silver,gold,control}`). No hay partición física: con este volumen solo crearía archivos pequeños. En producción se usaría liquid clustering o partición por fecha en hechos grandes, más `OPTIMIZE` o predictive optimization.
 
-No se aplicó particionamiento físico debido al volumen sintético reducido: particionar tablas pequeñas agrega archivos y complejidad sin mejorar rendimiento. En producción, las tablas grandes de hechos se particionarían por fecha (`order_date` o `payment_date`) y se evaluaría `OPTIMIZE` / Z-Ordering según los patrones reales de consulta.
+### Gold (opcional)
 
-### Extensión Gold
+`fact_sales` tiene una fila por línea de pedido y conserva cancelados con `is_revenue = false`. `agg_daily_sales` y el KPI suman solo pedidos no cancelados y sin baja lógica.
 
-Como extensión mínima se crearon:
+## Cómo ejecutarlo
 
-- `workspace.gold.dim_customers`
-- `workspace.gold.dim_products`
-- `workspace.gold.dim_date`
-- `workspace.gold.fact_sales`
-- `workspace.gold.agg_daily_sales`
+### 1. Requisitos
 
-`fact_sales` tiene una fila por línea de pedido. Se conecta conceptualmente con clientes, productos y fechas. `agg_daily_sales` agrega pedidos, unidades e ingresos por fecha, categoría y canal.
+- Python 3.10+, ODBC Driver 18 for SQL Server, `pip install -r requirements.txt`.
+- Azure SQL Database y Databricks (Free Edition sirve) con Unity Catalog.
+- Databricks CLI ≥ 0.218 para el Bundle (`databricks auth login --host <workspace-url>`).
+- Copiar `.env.example` a `.env` y completar credenciales (no se versiona).
 
-Esta extensión demuestra cómo los datos Silver pueden materializarse para análisis sin reemplazar el modelo operacional validado de Silver.
-
-## Reproducibilidad
-
-### Requisitos
-
-- Azure SQL Database.
-- Python 3.10 o superior.
-- ODBC Driver 18 for SQL Server.
-- Dependencias Python del proyecto.
-- Databricks Free Edition con Unity Catalog habilitado.
-
-### Variables de entorno
-
-Crear un archivo `.env` en la raíz del proyecto, sin versionarlo:
-
-```env
-AZURE_SQL_SERVER=tu-servidor.database.windows.net
-AZURE_SQL_DATABASE=tu-base-de-datos
-AZURE_SQL_USERNAME=tu-usuario
-AZURE_SQL_PASSWORD=tu-password
-```
-
-### Ejecución
-
-1. Crear las tablas fuente ejecutando los scripts DDL de `sql/`.
-2. Generar e insertar los datos sintéticos directamente en Azure SQL.
-3. Exportar la fuente a staging:
+### 2. Fuente (Azure SQL)
 
 ```bash
-python sql/04_export_source_to_csv.py
+# Ejecutar sql/01_create_source_schema.sql en la base (Query editor del portal o sqlcmd)
+python sql/02_seed_source_data.py                      # carga sintética (borra y recarga)
 ```
 
-4. Cargar los seis CSV de `data/staging/` al Volume `workspace.bronze.landing`.
-5. Ejecutar, en este orden, los notebooks:
+### 3. Despliegue del Job (Bundle)
 
-   - `01_ingest_bronze.py`
-   - `02_transform_silver.py`
-   - `03_publish_gold.py` (extensión no obligatoria)
+```bash
+databricks bundle validate -t dev
+databricks bundle deploy   -t dev     # sube notebooks + src/ y crea el Job "[dev <usuario>] andina-lakehouse-dev"
+```
+
+| Target | Esquemas | Landing Volume | Schedule |
+|---|---|---|---|
+| `dev` | `workspace.dev_bronze`, `dev_silver`, ... | `/Volumes/workspace/dev_bronze/landing` | pausado |
+| `staging` | `workspace.stg_*` | `/Volumes/workspace/stg_bronze/landing` | pausado |
+| `prod` | `workspace.bronze`, ... | `/Volumes/workspace/bronze/landing` | cada hora |
+
+La primera ejecución del Job crea los esquemas y los Volumes (`landing`, `checkpoints`).
+
+### 4. Carga inicial e incremental
+
+```bash
+# Carga inicial completa → Volume del target
+python sql/04_export_source_to_csv.py --mode full --upload --volume-path /Volumes/workspace/dev_bronze/landing
+databricks bundle run -t dev andina_lakehouse_job
+
+# Simular un día de cambios y cargar solo lo que cambió
+python sql/05_simulate_source_changes.py
+python sql/04_export_source_to_csv.py --upload --volume-path /Volumes/workspace/dev_bronze/landing
+databricks bundle run -t dev andina_lakehouse_job
+```
+
+Los notebooks `02_transform_silver` y `01_ingest_bronze` muestran al final ejemplos de historial: un cliente que cambió de segmento y un pago `pending → approved`. Para reconstruir todo, usar el parámetro `full_refresh=true` del Job.
+
+> Si antes se cargaron CSV sueltos en la raíz del Volume `landing` (versión anterior), hay que borrarlos. Auto Loader lee `landing/<tabla>/`.
+
+### 5. Ejecución local (sin Databricks)
+
+El mismo paquete `src/andina_pipeline` corre en Spark local con Delta. Cambia Auto Loader por el lector de archivos de Structured Streaming (mismo checkpoint y append):
+
+```bash
+python scripts/run_local_pipeline.py --reset            # Bronze → Silver → Gold desde data/staging
+python scripts/run_local_pipeline.py                    # incremental: solo archivos nuevos
+python scripts/run_local_pipeline.py --inject-bad-rows  # demuestra cuarentena y corte por umbral
+python -m pytest -q                                     # 18 pruebas (contrato, Silver, SCD2, Bronze, Gold)
+```
+
+Spark local necesita Java 17. Si no hay acceso a Maven, se pueden pasar los JAR de Delta con `DELTA_JARS=/ruta/delta-spark_2.12-3.2.0.jar,/ruta/delta-storage-3.2.0.jar`.
+
+## Evidencia de pruebas locales
+
+Corrida de punta a punta con SQL Server 2022 en Docker (en lugar de Azure SQL; mismo dialecto T-SQL) y Spark 3.5 + Delta 3.2 local:
+
+| Paso | Resultado |
+|---|---|
+| Seed | 2.000 clientes, 40 productos, 12.000 pedidos, 22.409 líneas, 12.974 pagos, 1.500 tickets |
+| Export full + pipeline `--reset` | Bronze = Silver = filas fuente. Hallazgos `warn` esperados: 3 emails inválidos, 2 tickets vacíos, 15 pedidos con total ≠ líneas, 8 cobros duplicados |
+| Simulación + export incremental | solo cambios: 49 clientes, 4 productos, 268 pedidos, 275 líneas, 164 pagos, 36 tickets |
+| Pipeline incremental | Bronze agrega solo esos archivos (checkpoint). Silver procesa solo esas filas: +48 versiones SCD2 de clientes, +237 de pedidos, +163 de pagos. Las tablas actuales siguen con una fila por llave |
+| `--inject-bad-rows` (umbral 5 %) | `DataQualityError: orders: 3/3 filas con errores (100.0%) superan el umbral` → no se escribe nada |
+| Reintento con `--max-error-rate 1.0` | las 3 filas van a `control.quarantine_records` con sus motivos: total negativo, cliente huérfano, fecha imposible de convertir y estado fuera de dominio |
+| `pytest` | 18 pruebas pasan |
+
+Ejemplo de historial en `silver.payments_history`: un pago con estado `approved` y luego `refunded`, con `valid_to` de la primera versión igual a `valid_from` de la segunda. En `silver.customers_history`: clientes `Regular → Premium` y `Premium → Business`.
+
+En Spark local, el metastore Derby muestra un `ERROR HiveAlterHandler` al reescribir las tablas Gold. Es ruido del metastore local: las tablas Delta se escriben bien y en Databricks (Unity Catalog) no ocurre.
+
+**No probado en este entorno:** Auto Loader (`cloudFiles` solo existe en Databricks) y el despliegue del Bundle contra un workspace real. El YAML se validó contra el JSON schema oficial de la Databricks CLI.
 
 ## Estructura del repositorio
 
 ```text
-sql/                  DDL, generación de datos y exportación Azure SQL
-notebooks/            Notebooks de ingesta y transformación
-diagrams/             Diagramas de arquitectura y modelo de datos
-docs/                 Decisiones, evidencias y material de sustentación
-data/staging/         Archivos temporales locales, excluidos de Git
-README.md             Documentación principal
+sql/                    DDL, seed sintético, simulación de cambios, export incremental, conexión
+src/andina_pipeline/    config (contrato), bronze, silver, quality, gold, pipeline, spark_session
+notebooks/              notebooks delgados del Job (importan src/)
+resources/              definición del Job del Bundle
+databricks.yml          Bundle con targets dev / staging / prod
+scripts/                ejecución local y generador de clickstream
+data/samples/           clickstream_events.jsonl
+tests/                  pytest con Spark + Delta local
+diagrams/, docs/        arquitectura, modelo, ADRs, streaming/SAP, supuestos
 ```
 
 ## Supuestos y limitaciones
 
-- Los datos son sintéticos y se generaron de forma coherente con las relaciones del modelo.
-- La demostración usa una carga batch manual controlada por las restricciones de red de Databricks Free Edition.
-- La muestra de datos no tiene volumen suficiente para justificar particionamiento físico.
-- Azure SQL y Databricks Free Edition se usaron para controlar costos del entorno.
-- La operación productiva requeriría secretos gestionados, conectividad privada, un Job/Workflow, alertas y carga incremental mediante `MERGE`.
-- El archivo `.env` y los CSV de staging no se versionan porque pueden contener credenciales o datos temporales.
+Supuestos completos en [docs/assumptions.md](docs/assumptions.md). Principales limitaciones:
+
+- El export corre fuera de Databricks por la restricción de red de Free Edition. En producción se programaría (ADF, cron o un Job con conectividad privada).
+- El watermark por `updated_at` no detecta borrados físicos. La fuente usa bajas lógicas; para borrados físicos haría falta Change Tracking o CDC.
+- La historia SCD2 empieza en la primera carga. Una versión que llega más vieja que la vigente queda en Bronze, pero no se reinserta en el historial.
+- En Free Edition solo existe el catálogo `workspace`, por eso los entornos se separan con prefijo de esquema.
 
 ## Uso de IA
 
 El código del pipeline, los notebooks, las pruebas y gran parte de la documentación fueron generados con asistencia de IA. Yo configuré la infraestructura en Azure —incluyendo acceso de red y los identificadores de conexión—, desplegué y ejecuté la solución en Databricks, y revisé los resultados.
 
+En una segunda iteración usé un agente de IA (Devin) para revisar la entrega contra el enunciado y completar los niveles 1 y 2: carga incremental, Auto Loader, SCD2, calidad con cuarentena, Bundle, clickstream y pruebas. Lo validó localmente con SQL Server en Docker y Spark + Delta.
+
 Esta entrega refleja una solución construida con apoyo de IA, que posteriormente configuré, ejecuté y comprendí para poder explicarla.
 
 ## Próximos pasos
 
-- Orquestar los notebooks con Databricks Jobs/Workflows.
-- Implementar JDBC incremental directo con secretos gestionados y conectividad segura.
-- Implementar SCD Tipo 2 para atributos de cliente que requieran historial.
-- Añadir monitoreo, alertas y manejo de errores centralizado.
-- Construir un dashboard con KPIs de ingresos, pedidos, ticket promedio y ventas por canal.
-- Extender la solución a Feature Store, RAG y agentes GenAI cuando el alcance y el volumen lo justifiquen.
+- Conectividad privada y JDBC o Lakeflow Connect directo, con secret scope, eliminando el paso de archivos.
+- Alertas del Job (email o Slack) y un dashboard sobre `control.data_quality_results`.
+- Implementar el streaming de clickstream y la integración SAP descritos.
+- Dashboard de KPIs sobre Gold.
