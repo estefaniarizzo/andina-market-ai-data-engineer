@@ -1,146 +1,53 @@
-"""Unit tests for reusable data-quality rule logic.
+"""Pure-Python tests of the data contract and the declared quality rules (no Spark needed)."""
 
-These tests validate quality-rule behavior without requiring a live Spark
-session or Databricks environment.
-"""
-
-from datetime import datetime
+from andina_pipeline.config import ENTITIES, ENTITIES_BY_NAME, PARENT_BY_KEY, LakehouseConfig
+from andina_pipeline.quality import BUSINESS_RULES, DataQualityError, enforce_error_rate, rules_for
 
 import pytest
 
 
-def evaluate_null_rule(rows, column):
-    """Return failed row count for null values in the selected column."""
-    return sum(1 for row in rows if row.get(column) is None)
+def test_every_entity_has_key_and_watermark_rules():
+    for entity in ENTITIES:
+        names = {rule.name for rule in rules_for(entity)}
+        assert f"{entity.key}_not_null" in names
+        assert "updated_at_not_null" in names
+        assert "updated_at" in entity.column_names
 
 
-def evaluate_unique_rule(rows, key_column):
-    """Return duplicated row count for the selected primary key."""
-    seen = set()
-    duplicates = 0
-
-    for row in rows:
-        key = row.get(key_column)
-
-        if key in seen:
-            duplicates += 1
-        else:
-            seen.add(key)
-
-    return duplicates
+def test_typed_columns_get_parse_rules():
+    names = {rule.name for rule in rules_for(ENTITIES_BY_NAME["payments"])}
+    assert {"amount_parseable", "payment_date_parseable", "updated_at_parseable"} <= names
+    assert "payment_method_parseable" not in names  # strings are never "unparseable"
 
 
-def evaluate_referential_rule(child_rows, parent_rows, child_key, parent_key):
-    """Return orphan child row count for a parent-child relationship."""
-    parent_keys = {row.get(parent_key) for row in parent_rows}
-
-    return sum(
-        1
-        for row in child_rows
-        if row.get(child_key) not in parent_keys
-    )
+def test_business_rules_reference_known_entities_and_severities():
+    for rule in BUSINESS_RULES:
+        assert rule.entity in ENTITIES_BY_NAME
+        assert rule.severity in {"error", "warn"}
 
 
-def test_null_rule_detects_missing_required_values():
-    rows = [
-        {"order_id": 1, "order_total": 100.0},
-        {"order_id": 2, "order_total": None},
-        {"order_id": 3, "order_total": 250.0},
-    ]
-
-    assert evaluate_null_rule(rows, "order_total") == 1
+def test_payment_date_is_conditional_not_required():
+    rule = next(r for r in BUSINESS_RULES if r.name == "payment_date_required_when_settled")
+    assert "NOT IN ('approved', 'refunded')" in rule.expression
+    assert rule.severity == "error"
 
 
-def test_null_rule_passes_when_no_required_value_is_missing():
-    rows = [
-        {"order_id": 1, "order_total": 100.0},
-        {"order_id": 2, "order_total": 250.0},
-    ]
-
-    assert evaluate_null_rule(rows, "order_total") == 0
+def test_parents_are_processed_before_children():
+    order = [entity.name for entity in ENTITIES]
+    for entity in ENTITIES:
+        for fk in entity.parents:
+            assert order.index(PARENT_BY_KEY[fk].name) < order.index(entity.name)
 
 
-def test_unique_rule_detects_duplicate_primary_keys():
-    rows = [
-        {"customer_id": 1},
-        {"customer_id": 2},
-        {"customer_id": 1},
-        {"customer_id": 3},
-        {"customer_id": 2},
-    ]
-
-    assert evaluate_unique_rule(rows, "customer_id") == 2
+def test_environment_isolation_with_schema_prefix():
+    dev = LakehouseConfig(schema_prefix="dev_")
+    assert dev.table("silver", "customers") == "workspace.dev_silver.customers"
+    assert dev.landing_path == "/Volumes/workspace/dev_bronze/landing"
+    assert LakehouseConfig().bronze == "workspace.bronze"
 
 
-def test_unique_rule_passes_for_distinct_primary_keys():
-    rows = [
-        {"customer_id": 1},
-        {"customer_id": 2},
-        {"customer_id": 3},
-    ]
-
-    assert evaluate_unique_rule(rows, "customer_id") == 0
-
-
-def test_referential_rule_detects_orphan_orders():
-    customers = [
-        {"customer_id": 1},
-        {"customer_id": 2},
-    ]
-
-    orders = [
-        {"order_id": 10, "customer_id": 1},
-        {"order_id": 11, "customer_id": 99},
-    ]
-
-    failed_rows = evaluate_referential_rule(
-        child_rows=orders,
-        parent_rows=customers,
-        child_key="customer_id",
-        parent_key="customer_id",
-    )
-
-    assert failed_rows == 1
-
-
-def test_referential_rule_passes_for_valid_relationships():
-    products = [
-        {"product_id": 1},
-        {"product_id": 2},
-    ]
-
-    order_items = [
-        {"order_item_id": 100, "product_id": 1},
-        {"order_item_id": 101, "product_id": 2},
-    ]
-
-    failed_rows = evaluate_referential_rule(
-        child_rows=order_items,
-        parent_rows=products,
-        child_key="product_id",
-        parent_key="product_id",
-    )
-
-    assert failed_rows == 0
-
-
-def test_quality_result_status_is_passed_when_no_failures():
-    failed_rows = 0
-
-    status = "passed" if failed_rows == 0 else "failed"
-
-    assert status == "passed"
-
-
-def test_quality_result_status_is_failed_when_duplicates_exist():
-    failed_rows = 3
-
-    status = "passed" if failed_rows == 0 else "failed"
-
-    assert status == "failed"
-
-
-def test_quality_check_timestamp_is_timezone_aware():
-    checked_at = datetime.now().astimezone()
-
-    assert checked_at.tzinfo is not None
+def test_error_rate_gate():
+    enforce_error_rate("orders", total=100, errors=5, max_error_rate=0.05)
+    with pytest.raises(DataQualityError):
+        enforce_error_rate("orders", total=100, errors=6, max_error_rate=0.05)
+    enforce_error_rate("orders", total=0, errors=0, max_error_rate=0.05)

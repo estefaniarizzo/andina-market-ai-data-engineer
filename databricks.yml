@@ -1,0 +1,55 @@
+# Databricks Asset Bundle: deploys the notebooks, the src/ package and the job.
+#
+#   databricks bundle validate -t dev
+#   databricks bundle deploy   -t dev
+#   databricks bundle run      -t dev andina_lakehouse_job
+#
+# Environments share the code and differ only in variables: in Databricks Free
+# Edition there is a single catalog (`workspace`), so isolation is done with a
+# schema prefix (dev_bronze, stg_bronze, bronze). With more catalogs available,
+# set `catalog` per target instead (andina_dev, andina_stg, andina_prod).
+
+bundle:
+  name: andina-market-lakehouse
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Unity Catalog catalog
+    default: workspace
+  schema_prefix:
+    description: Prefix for bronze/silver/gold/control schemas
+    default: ""
+  max_error_rate:
+    description: Max share of quarantined rows per batch before Silver fails
+    default: "0.05"
+  schedule_pause_status:
+    description: PAUSED or UNPAUSED for the hourly schedule
+    default: PAUSED
+
+targets:
+  dev:
+    mode: development  # resources prefixed with [dev <user>], schedules paused
+    default: true
+    variables:
+      schema_prefix: dev_
+      max_error_rate: "0.20"
+
+  staging:
+    workspace:
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      schema_prefix: stg_
+
+  prod:
+    mode: production
+    workspace:
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      schema_prefix: ""
+      schedule_pause_status: UNPAUSED
+    # In a real workspace run prod as a service principal:
+    # run_as:
+    #   service_principal_name: <application-id>

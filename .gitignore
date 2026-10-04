@@ -35,3 +35,12 @@ tmp/
 # Temporary local staging exports
 data/staging/
 data/staging/*
+# Local export watermarks (state of sql/04_export_source_to_csv.py)
+data/state/
+
+# Local lakehouse produced by scripts/run_local_pipeline.py
+data/local_lakehouse/
+spark-warehouse/
+metastore_db/
+derby.log
+!.env.example
